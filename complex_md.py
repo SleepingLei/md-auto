@@ -5,6 +5,83 @@ import glob
 from rdkit import Chem
 
 
+def prepare_receptor(receptor_mol2, output_pdb="receptor_prepared.pdb"):
+    """
+    完整的受体准备流程（适用于RNA和蛋白质）
+
+    步骤：
+    1. MOL2 → PDB转换（OpenBabel）
+    2. reduce添加氢原子（优化氢键网络）
+    3. pdb4amber清理PDB（AMBER兼容性）
+
+    参数：
+        receptor_mol2: 输入MOL2文件
+        output_pdb: 输出PDB文件
+    """
+    print(f"\n{'='*60}")
+    print(f"受体准备流程: {receptor_mol2}")
+    print(f"{'='*60}")
+
+    # 步骤1: MOL2 → PDB（不加氢，下一步用reduce加）
+    temp_pdb = "receptor_temp.pdb"
+    print(f"\n[1/3] MOL2转PDB...")
+    cmd = f"obabel {receptor_mol2} -O {temp_pdb}"
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+    if result.returncode != 0 or not os.path.exists(temp_pdb):
+        # 备选: RDKit
+        print("  OpenBabel失败，尝试RDKit...")
+        try:
+            from rdkit import Chem
+            mol = Chem.MolFromMol2File(receptor_mol2, removeHs=False)
+            if mol is not None:
+                Chem.MolToPDBFile(mol, temp_pdb)
+                print("  ✓ RDKit转换成功")
+            else:
+                raise RuntimeError("RDKit无法读取MOL2文件")
+        except Exception as e:
+            raise RuntimeError(f"MOL2转换失败: {e}\n请安装: conda install -c conda-forge openbabel")
+    else:
+        print(f"  ✓ OpenBabel转换成功")
+
+    # 步骤2: reduce添加氢原子
+    reduced_pdb = "receptor_reduced.pdb"
+    print(f"\n[2/3] 使用reduce添加氢原子...")
+    cmd = f"reduce -BUILD {temp_pdb} > {reduced_pdb} 2>/dev/null"
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+    if result.returncode != 0 or not os.path.exists(reduced_pdb) or os.path.getsize(reduced_pdb) == 0:
+        print("  ⚠ reduce不可用或失败，跳过此步骤")
+        print("  建议安装: conda install -c conda-forge reduce")
+        reduced_pdb = temp_pdb
+    else:
+        print(f"  ✓ reduce完成")
+
+    # 步骤3: pdb4amber清理
+    print(f"\n[3/3] 使用pdb4amber清理PDB...")
+    cmd = f"pdb4amber -i {reduced_pdb} -o {output_pdb} -y --nohyd --noter"
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+
+    if result.returncode != 0 or not os.path.exists(output_pdb):
+        print("  ⚠ pdb4amber失败，使用未清理的PDB")
+        print(f"  警告信息: {result.stderr}")
+        shutil.copy(reduced_pdb, output_pdb)
+    else:
+        print(f"  ✓ pdb4amber完成")
+        # 打印pdb4amber的信息（可能有警告）
+        if result.stdout:
+            print(f"\n  pdb4amber输出:\n{result.stdout}")
+
+    # 清理临时文件
+    for tmp in [temp_pdb, reduced_pdb, "reduce_info.txt"]:
+        if os.path.exists(tmp) and tmp != output_pdb:
+            os.remove(tmp)
+
+    print(f"\n✓ 受体准备完成: {output_pdb}")
+    print(f"{'='*60}\n")
+    return output_pdb
+
+
 def get_charge_from_smiles(smiles):
     """
     从SMILES计算分子净电荷
@@ -68,6 +145,9 @@ def construct_complex_top(receptor_mol2, ligand_pdb, ligand_smi, work_pwd,
 
     os.chdir(work_pwd)
 
+    # 受体准备流程（MOL2 → PDB + reduce + pdb4amber）
+    receptor_pdb = prepare_receptor("receptor.mol2", "receptor_prepared.pdb")
+
     # 配体参数化
     ligand_mol2, ligand_frcmod = prepare_ligand("ligand.pdb", "ligand.smi", work_pwd)
 
@@ -118,8 +198,8 @@ addionsrand complex Cl- 0"""
 loadamberparams {ligand_frcmod}
 LIG = loadmol2 {ligand_mol2}
 
-# 加载受体
-REC = loadmol2 receptor.mol2
+# 加载受体（使用PDB格式避免MOL2原子类型问题）
+REC = loadpdb {receptor_pdb}
 
 # 合并形成复合物
 complex = combine {{REC LIG}}
