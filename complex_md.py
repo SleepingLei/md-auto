@@ -2,7 +2,89 @@ import os
 import subprocess
 import shutil
 import glob
+import re
 from rdkit import Chem
+
+
+def normalize_rna_residue_names(pdb_file):
+    """
+    规范化RNA残基名称
+
+    处理对接软件常见的非标准残基命名：
+    - C25, C_25, CYT → C
+    - G25, G_25, GUA → G
+    - A25, A_25, ADE → A
+    - U25, U_25, URA → U
+    - T25, T_25, THY → T
+
+    保留残基编号，仅修改残基类型
+    """
+    # RNA残基映射表
+    RNA_RESIDUE_MAP = {
+        'CYT': 'C', 'GUA': 'G', 'ADE': 'A', 'URA': 'U', 'THY': 'T',
+    }
+
+    # 读取PDB
+    with open(pdb_file, 'r') as f:
+        lines = f.readlines()
+
+    # 诊断：检测所有残基名
+    residues_found = set()
+    for line in lines:
+        if line.startswith('ATOM') or line.startswith('HETATM'):
+            resname = line[17:20].strip()
+            if resname:
+                residues_found.add(resname)
+
+    print(f"  检测到的残基: {sorted(residues_found)}")
+
+    # 检测非标准RNA残基
+    standard_rna = {'A', 'U', 'G', 'C', 'T', 'RA', 'RU', 'RG', 'RC', 'RT', 'DA', 'DT', 'DG', 'DC'}
+    non_standard = [r for r in residues_found if r not in standard_rna and r[0] in 'AUGCT']
+
+    if non_standard:
+        print(f"  ⚠ 检测到非标准RNA残基: {non_standard}")
+        print(f"  → 将规范化为标准AMBER格式")
+    else:
+        print(f"  ✓ 所有残基名已是标准格式")
+        return pdb_file
+
+    # 修复残基名
+    fixed_lines = []
+    fixes_count = 0
+
+    for line in lines:
+        if line.startswith('ATOM') or line.startswith('HETATM'):
+            resname = line[17:20].strip()
+            new_resname = resname
+
+            # 策略1: 直接映射（CYT → C）
+            if resname in RNA_RESIDUE_MAP:
+                new_resname = RNA_RESIDUE_MAP[resname]
+                fixes_count += 1
+
+            # 策略2: 提取首字母（C25 → C, G_25 → G）
+            elif resname and resname[0] in 'AUGCT':
+                # 匹配模式：字母 + 数字/下划线
+                match = re.match(r'^([AUGCT])\d+$|^([AUGCT])_', resname)
+                if match:
+                    new_resname = match.group(1) or match.group(2)
+                    fixes_count += 1
+
+            # 重写PDB行（残基名在17-20列，右对齐）
+            if new_resname != resname:
+                line = line[:17] + f'{new_resname:>3}' + line[20:]
+
+        fixed_lines.append(line)
+
+    # 写回PDB
+    with open(pdb_file, 'w') as f:
+        f.writelines(fixed_lines)
+
+    if fixes_count > 0:
+        print(f"  ✓ 修复了 {fixes_count} 个原子的残基名")
+
+    return pdb_file
 
 
 def prepare_receptor(receptor_mol2, output_pdb="receptor_prepared.pdb"):
@@ -13,6 +95,7 @@ def prepare_receptor(receptor_mol2, output_pdb="receptor_prepared.pdb"):
     1. MOL2 → PDB转换（OpenBabel）
     2. reduce添加氢原子（优化氢键网络）
     3. pdb4amber清理PDB（AMBER兼容性）
+    4. RNA残基名规范化（修复C25→C等问题）
 
     参数：
         receptor_mol2: 输入MOL2文件
@@ -24,7 +107,7 @@ def prepare_receptor(receptor_mol2, output_pdb="receptor_prepared.pdb"):
 
     # 步骤1: MOL2 → PDB（不加氢，下一步用reduce加）
     temp_pdb = "receptor_temp.pdb"
-    print(f"\n[1/3] MOL2转PDB...")
+    print(f"\n[1/4] MOL2转PDB...")
     cmd = f"obabel {receptor_mol2} -O {temp_pdb}"
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
@@ -46,7 +129,7 @@ def prepare_receptor(receptor_mol2, output_pdb="receptor_prepared.pdb"):
 
     # 步骤2: reduce添加氢原子
     reduced_pdb = "receptor_reduced.pdb"
-    print(f"\n[2/3] 使用reduce添加氢原子...")
+    print(f"\n[2/4] 使用reduce添加氢原子...")
     cmd = f"reduce -BUILD {temp_pdb} > {reduced_pdb} 2>/dev/null"
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
@@ -58,22 +141,28 @@ def prepare_receptor(receptor_mol2, output_pdb="receptor_prepared.pdb"):
         print(f"  ✓ reduce完成")
 
     # 步骤3: pdb4amber清理
-    print(f"\n[3/3] 使用pdb4amber清理PDB...")
-    cmd = f"pdb4amber -i {reduced_pdb} -o {output_pdb} -y --nohyd --noter"
+    pdb4amber_pdb = "receptor_pdb4amber.pdb"
+    print(f"\n[3/4] 使用pdb4amber清理PDB...")
+    cmd = f"pdb4amber -i {reduced_pdb} -o {pdb4amber_pdb} -y --nohyd --noter"
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
-    if result.returncode != 0 or not os.path.exists(output_pdb):
+    if result.returncode != 0 or not os.path.exists(pdb4amber_pdb):
         print("  ⚠ pdb4amber失败，使用未清理的PDB")
         print(f"  警告信息: {result.stderr}")
-        shutil.copy(reduced_pdb, output_pdb)
+        shutil.copy(reduced_pdb, pdb4amber_pdb)
     else:
         print(f"  ✓ pdb4amber完成")
         # 打印pdb4amber的信息（可能有警告）
         if result.stdout:
             print(f"\n  pdb4amber输出:\n{result.stdout}")
 
+    # 步骤4: RNA残基名规范化
+    print(f"\n[4/4] 规范化RNA残基名...")
+    normalize_rna_residue_names(pdb4amber_pdb)
+    shutil.copy(pdb4amber_pdb, output_pdb)
+
     # 清理临时文件
-    for tmp in [temp_pdb, reduced_pdb, "reduce_info.txt"]:
+    for tmp in [temp_pdb, reduced_pdb, pdb4amber_pdb, "reduce_info.txt"]:
         if os.path.exists(tmp) and tmp != output_pdb:
             os.remove(tmp)
 
